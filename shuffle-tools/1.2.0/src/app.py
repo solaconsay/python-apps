@@ -1,20 +1,24 @@
-import asyncio
+import os
+import sys
+import builtins
+
+import hmac
 import datetime
 import json
 import time
 import markupsafe
-import os
 import re
 import subprocess
 import tempfile
 import zipfile
 import base64
+import gzip
 import ipaddress
 import hashlib
 from io import StringIO
 from contextlib import redirect_stdout
-from liquid import Liquid
-import liquid
+import random
+import string
 
 import xmltodict
 from json2xml import json2xml
@@ -33,7 +37,18 @@ import tarfile
 import binascii
 import struct
 
+import paramiko
+import concurrent.futures
+import multiprocessing
+
 from walkoff_app_sdk.app_base import AppBase
+#from shuffle_sdk import AppBase
+
+# Override exit(), sys.exit, and os._exit 
+# sys.exit() can be caught, meaning we can have a custom handler for it
+builtins.exit = sys.exit
+os.exit = sys.exit
+os._exit = sys.exit
 
 class Tools(AppBase):
     __version__ = "1.2.0"
@@ -48,6 +63,8 @@ class Tools(AppBase):
         :param logger:
         :param console_logger:
         """
+        self.cache_update_buffer = []
+        self.shared_cache = {}
         super().__init__(redis, logger, console_logger)
 
     def router(self):
@@ -55,51 +72,101 @@ class Tools(AppBase):
 
     def base64_conversion(self, string, operation):
         if operation == "encode":
-            encoded_bytes = base64.b64encode(string.encode("utf-8"))
+            # Try JSON decoding
+            try:
+                string = json.dumps(json.loads(string))
+            except:
+                pass
+
+            encoded_bytes = base64.b64encode(str(string).encode("utf-8"))
             encoded_string = str(encoded_bytes, "utf-8")
             return encoded_string
 
-        elif operation == "decode":
+        elif operation == "to image":
+            # Decode the base64 into an image and upload it as a file
+            decoded_bytes = base64.b64decode(string)
+
+            # Make the bytes into unicode escaped bytes 
+            # UnicodeDecodeError - 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
             try:
-                decoded_bytes = base64.b64decode(string)
-                try:
-                    decoded_bytes = str(decoded_bytes, "utf-8")
-                except:
-                    pass
+                decoded_bytes = str(decoded_bytes, "utf-8")
+            except:
+                pass
 
-                return decoded_bytes
-            except Exception as e:
-                #return string.decode("utf-16")
-
-                self.logger.info(f"[WARNING] Error in normal decoding: {e}")
-                return {
-                    "success": False,
-                    "reason": f"Error decoding the base64: {e}",
-                }
-                #newvar = binascii.a2b_base64(string)
-                #try:
-                #    if str(newvar).startswith("b'") and str(newvar).endswith("'"):
-                #        newvar = newvar[2:-1]
-                #except Exception as e:
-                #    self.logger.info(f"Encoding issue in base64: {e}")
-                #return newvar
-
-                #try:
-                #    return newvar
-                #except:
-                #    pass
-
-            return {
-                "success": False,
-                "reason": "Error decoding the base64",
+            filename = "base64_image.png"
+            file = {
+                "filename": filename,
+                "data": decoded_bytes, 
             }
 
-        return json.dumps({
+            fileret = self.set_files([file])
+            value = {"success": True, "filename": filename, "file_id": fileret}
+            if len(fileret) == 1:
+                value = {"success": True, "filename": filename, "file_id": fileret[0]}
+
+            return value
+
+        elif operation == "decode":
+
+            if "-" in string:
+                string = string.replace("-", "+", -1)
+
+            if "_" in string:
+                string = string.replace("_", "/", -1)
+
+            # Fix padding
+            if len(string) % 4 != 0:
+                string += "=" * (4 - len(string) % 4)
+
+
+            # For loop this. It's stupid.
+            decoded_bytes = "" 
+            try:
+                decoded_bytes = base64.b64decode(string)
+            except Exception as e:
+                return json.dumps({
+                    "success": False,
+                    "reason": "Invalid Base64 - %s" % e,
+                })
+
+                #if "incorrect padding" in str(e).lower():
+                #    try:
+                #        decoded_bytes = base64.b64decode(string + "=")
+                #    except Exception as e:
+                #        if "incorrect padding" in str(e).lower():
+                #            try:
+                #                decoded_bytes = base64.b64decode(string + "==")
+                #            except Exception as e:
+                #                if "incorrect padding" in str(e).lower():
+                #                    try:
+                #                        decoded_bytes = base64.b64decode(string + "===")
+                #                    except Exception as e:
+                #                        if "incorrect padding" in str(e).lower():
+                #                            return "Invalid Base64"
+
+
+            try:
+                decoded_bytes = str(decoded_bytes, "utf-8")
+            except:
+                pass
+
+            # Check if json
+            try:
+                decoded_bytes = json.loads(decoded_bytes)
+            except:
+                pass
+
+            return decoded_bytes
+
+        return {
             "success": False,
-            "reason": "No base64 to be converted",
-        })
+            "reason": "Invalid operation",
+        }
 
     def parse_list_internal(self, input_list):
+        if isinstance(input_list, list):
+            input_list = ",".join(input_list)
+
         try:
             input_list = json.loads(input_list)
             if isinstance(input_list, list):
@@ -126,7 +193,7 @@ class Tools(AppBase):
 
         url = "https://shuffler.io/api/v1/functions/sendsms"
         headers = {"Authorization": "Bearer %s" % apikey}
-        return requests.post(url, headers=headers, json=data).text
+        return requests.post(url, headers=headers, json=data, verify=False).text
 
     # This is an email function of Shuffle
     def send_email_shuffle(self, apikey, recipients, subject, body, attachments=""):
@@ -144,6 +211,7 @@ class Tools(AppBase):
             "subject": subject, 
             "body": body, 
             "type": "alert",
+            "email_app": True,
         }
 
         # Read the attachments
@@ -157,15 +225,88 @@ class Tools(AppBase):
             
                 data["attachments"] = files
             except Exception as e:
-                self.logger.info(f"Error in attachment parsing for email: {e}")
+                pass
                 
 
-        url = "https://shuffler.io/api/v1/functions/sendmail"
+        url = "https://shuffler.io/functions/sendmail"
         headers = {"Authorization": "Bearer %s" % apikey}
         return requests.post(url, headers=headers, json=data).text
 
     def repeat_back_to_me(self, call):
         return call
+
+    def dedup_and_merge(self, key, value, timeout, set_skipped=True):
+        timeout = int(timeout)
+        key = str(key)
+
+        set_skipped = True
+        if str(set_skipped).lower() == "false":
+            set_skipped = False
+        else:
+            set_skipped = True
+
+        cachekey = "dedup-%s" % (key)
+        response = {
+            "success": False,
+            "datastore_key": cachekey,
+            "info": "All keys from the last %d seconds with the key '%s' have been merged. The result was set to SKIPPED in all other actions." % (timeout, key),
+            "timeout": timeout,
+            "original_value": value,
+            "all_values": [],
+        }
+
+        found_cache = self.get_cache(cachekey)
+
+        if found_cache["success"] == True and len(found_cache["value"]) > 0:
+            if "value" in found_cache:
+                if not str(found_cache["value"]).startswith("["):
+                    found_cache["value"] = [found_cache["value"]]
+                else:
+                    try:
+                        found_cache["value"] = json.loads(found_cache["value"])
+                    except Exception as e:
+                        self.logger.info("[ERROR] Failed parsing JSON: %s" % e)
+            else:
+                found_cache["value"] = []
+
+            found_cache["value"].append(value)
+            if "created" in found_cache:
+                if found_cache["created"] + timeout + 3 < time.time():
+                    set_skipped = False 
+                    response["success"] = True
+                    response["all_values"] = found_cache["value"]
+
+                    self.delete_cache(cachekey)
+
+                    return json.dumps(response)
+                else:
+                    self.logger.info("Dedup-key is already handled in another workflow with timeout %d" % timeout)
+
+            self.set_cache(cachekey, json.dumps(found_cache["value"]))
+            if set_skipped == True:
+                self.action_result["status"] = "SKIPPED"
+                self.action_result["result"] = json.dumps({
+                    "status": False,
+                    "reason": "Dedup-key is already handled in another workflow with timeout %d" % timeout,
+                })
+
+                self.send_result(self.action_result, {"Authorization": "Bearer %s" % self.authorization}, "/api/v1/streams")
+
+            return found_cache
+
+        parsedvalue = [value]
+        resp = self.set_cache(cachekey, json.dumps(parsedvalue))
+
+        self.logger.info("Sleeping for %d seconds while waiting for cache to fill up elsewhere" % timeout)
+        time.sleep(timeout)
+        found_cache = self.get_cache(cachekey)
+
+        response["success"] = True
+        response["all_values"] = found_cache["value"]
+
+        self.delete_cache(cachekey)
+        return json.dumps(response)
+
 
     # https://github.com/fhightower/ioc-finder
     def parse_file_ioc(self, file_ids, input_type="all"):
@@ -232,69 +373,16 @@ class Tools(AppBase):
             return "Invalid input"
         return return_value
 
-    # https://github.com/fhightower/ioc-finder
-    def parse_ioc(self, input_string, input_type="all"):
-        #if len(input_string) > 2500000 and (input_type == "" or input_type == "all"):
-        #    return {
-        #        "success": False,
-        #        "reason": "Data too large (%d). Please reduce it below 2.5 Megabytes to use this action or specify the input type" % len(input_string)
-        #    }
-
-        # https://github.com/fhightower/ioc-finder/blob/6ff92a73a60e9233bf09b530ccafae4b4415b08a/ioc_finder/ioc_finder.py#L433
-        ioc_types = ["domains", "urls", "email_addresses", "ipv6s", "ipv4s", "ipv4_cidrs", "md5s", "sha256s", "sha1s", "cves"]
-        input_string = str(input_string)
-        if input_type == "":
-            input_type = "all"
-        else:
-            input_type = input_type.split(",")
-            for item in input_type:
-                item = item.strip()
-
-            ioc_types = input_type
-
-        iocs = find_iocs(input_string, included_ioc_types=ioc_types)
-        newarray = []
-        for key, value in iocs.items():
-            if input_type != "all":
-                if key not in input_type:
-                    continue
-
-            if len(value) > 0:
-                for item in value:
-                    # If in here: attack techniques. Shouldn't be 3 levels so no
-                    # recursion necessary
-                    if isinstance(value, dict):
-                        for subkey, subvalue in value.items():
-                            if len(subvalue) > 0:
-                                for subitem in subvalue:
-                                    data = {
-                                        "data": subitem,
-                                        "data_type": "%s_%s" % (key[:-1], subkey),
-                                    }
-                                    if data not in newarray:
-                                        newarray.append(data)
-                    else:
-                        data = {"data": item, "data_type": key[:-1]}
-                        if data not in newarray:
-                            newarray.append(data)
-
-        # Reformatting IP
-        for item in newarray:
-            if "ip" in item["data_type"]:
-                item["data_type"] = "ip"
-                try:
-                    item["is_private_ip"] = ipaddress.ip_address(item["data"]).is_private
-                except:
-                    self.logger.info("Error parsing %s" % item["data"])
-
-        try:
-            newarray = json.dumps(newarray)
-        except json.decoder.JSONDecodeError as e:
-            return "Failed to parse IOC's: %s" % e
-
-        return newarray
-
     def parse_list(self, items, splitter="\n"):
+        # Check if it's already a list first
+        try:
+            newlist = json.loads(items)
+            if isinstance(newlist, list):
+                return newlist
+
+        except Exception as e:
+            self.logger.info("[WARNING] Parse error - fallback: %s" % e)
+
         if splitter == "":
             splitter = "\n"
 
@@ -313,7 +401,6 @@ class Tools(AppBase):
         return str(len(item))
 
     def set_json_key(self, json_object, key, value):
-        self.logger.info(f"OBJ: {json_object}\nKEY: {key}\nVAL: {value}")
         if isinstance(json_object, str):
             try:
                 json_object = json.loads(json_object)
@@ -360,7 +447,6 @@ class Tools(AppBase):
                 buildstring += f"[\"{subkey}\"]" 
 
             buildstring += f" = {value}"
-            self.logger.info("BUILD: %s" % buildstring)
 
             #output = 
             exec(buildstring)
@@ -444,7 +530,6 @@ class Tools(AppBase):
             }
 
             matches = re.findall(regex, input_data)
-            self.logger.info(f"{matches}")
             found = False
             for item in matches:
                 if isinstance(item, str):
@@ -477,19 +562,12 @@ class Tools(AppBase):
         self, input_data, regex, replace_string="", ignore_case="False"
     ):
 
-        #self.logger.info("=" * 80)
-        #self.logger.info(f"Regex: {regex}")
-        #self.logger.info(f"replace_string: {replace_string}")
-        #self.logger.info("=" * 80)
-
         if ignore_case.lower().strip() == "true":
             return re.sub(regex, replace_string, input_data, flags=re.IGNORECASE)
         else:
             return re.sub(regex, replace_string, input_data)
 
     def execute_python(self, code):
-        self.logger.info(f"Python code {len(code)} {code}. If uuid, we'll try to download and use the file.")
-
         if len(code) == 36 and "-" in code:
             filedata = self.get_file(code)
             if filedata["success"] == False:
@@ -504,37 +582,76 @@ class Tools(AppBase):
                     "message": f"Filename needs to contain .py",
                 }
 
-
         # Write the code to a file
         # 1. Take the data into a file
         # 2. Subprocess execute file?
         try:
             f = StringIO()
-            with redirect_stdout(f):
-                exec(code)  # nosec :(
+            def custom_print(*args, **kwargs):
+                return print(*args, file=f, **kwargs)
+            
+            #with redirect_stdout(f): # just in case
+            # Add globals in it too
+            globals_copy = globals().copy()
+            globals_copy["print"] = custom_print
+
+            # Add self to globals_copy
+            for key, value in locals().copy().items():
+                if key not in globals_copy:
+                    globals_copy[key] = value
+
+            globals_copy["self"] = self
+
+            try:
+                exec(code, globals_copy)
+            except SystemExit as e:
+                # Same as a return
+                pass
+            except SyntaxError as e:
+                # Special handler for return usage. Makes return act as 
+                # an exit()
+                if "'return' outside function" in str(e):
+                    return {
+                        "success": False,
+                        "message": f"SyntaxError - Shuffle Recommendation: Instead of using 'return' without a function, use 'exit()' to return when not inside a function. Raw Syntax error: {e}",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": f"Syntax Error: {e}",
+                    }
+
+            # this doesn't work to capture top-level returns
+            # Reason: SyntaxError makes it crash BEFORE it reaches the return
 
             s = f.getvalue()
+            f.close() # why: https://www.youtube.com/watch?v=6SA6S9Ca5-U
 
             #try:
             #    s = s.encode("utf-8")
             #except Exception as e:
-            #    self.logger.info(f"Failed utf-8 encoding response: {e}")
 
             try:
                 return {
                     "success": True,
-                    "message": s.strip(),
+                    "message": json.loads(s.strip()),
                 }
             except Exception as e:
-                return {
-                    "success": True,
-                    "message": s,
-                }
+                try:
+                    return {
+                        "success": True,
+                        "message": s.strip(),
+                    }
+                except Exception as e:
+                    return {
+                        "success": True,
+                        "message": s,
+                    }
                 
         except Exception as e:
             return {
                 "success": False,
-                "message": f"exception: {e}",
+                "message": f"Exception: {e}",
             }
 
     def execute_bash(self, code, shuffle_input):
@@ -548,7 +665,6 @@ class Tools(AppBase):
         stdout = process.communicate()
         item = ""
         if len(stdout[0]) > 0:
-            self.logger.info("[DEBUG] Succesfully ran bash!")
             item = stdout[0]
         else:
             self.logger.info(f"[ERROR] FAILED to run bash command {code}!")
@@ -562,8 +678,70 @@ class Tools(AppBase):
 
         return item
 
+    # Check if wildcardstring is in all_ips and support * as wildcard
+    def check_wildcard(self, wildcardstring, matching_string):
+        wildcardstring = str(wildcardstring.lower())
+        if wildcardstring in str(matching_string).lower():
+            return True
+        else:
+            wildcardstring = wildcardstring.replace(".", "\\.")
+            wildcardstring = wildcardstring.replace("*", ".*")
+
+            if re.match(wildcardstring, str(matching_string).lower()):
+                return True
+
+        return False
+
+    def preload_cache(self, key):
+        org_id = self.full_execution["workflow"]["execution_org"]["id"]
+        url = f"{self.url}/api/v1/orgs/{org_id}/get_cache"
+        data = {
+            "workflow_id": self.full_execution["workflow"]["id"],
+            "execution_id": self.current_execution_id,
+            "authorization": self.authorization,
+            "org_id": org_id,
+            "key": key,
+        }
+        get_response = requests.post(url, json=data, verify=False)
+        response_data = get_response.json()
+        if "value" in response_data:
+            raw_value = response_data["value"]
+            if isinstance(raw_value, str):
+                try:
+                    parsed = json.loads(raw_value)
+                except json.JSONDecodeError:
+                    parsed = [raw_value]
+            else:
+                parsed = raw_value
+
+            if not isinstance(parsed, list):
+                parsed = [parsed]
+
+            response_data["value"] = parsed
+        return get_response.json()
+
+
+    def update_cache(self, key):
+        org_id = self.full_execution["workflow"]["execution_org"]["id"]
+        url = f"{self.url}/api/v1/orgs/{org_id}/set_cache"
+        data = {
+            "workflow_id": self.full_execution["workflow"]["id"],
+            "execution_id": self.current_execution_id,
+            "authorization": self.authorization,
+            "org_id": org_id,
+            "key": key,
+            "value": json.dumps(self.shared_cache["value"]),
+        }
+
+        get_response = requests.post(url, json=data, verify=False)
+        self.cache_update_buffer = []
+        return get_response.json()
+
+
     def filter_list(self, input_list, field, check, value, opposite):
-        self.logger.info(f"\nRunning function with list {input_list}")
+
+        # Remove hashtags on the fly
+        # E.g. #.fieldname or .#.fieldname
 
         flip = False
         if str(opposite).lower() == "true":
@@ -583,14 +761,16 @@ class Tools(AppBase):
         if not isinstance(input_list, list):
             return {
                 "success": False,
-                "reason": "Error: input isnt a list. Remove # to use this action.", 
+                "reason": "Error: input isnt a list. Please use conditions instead if using JSON.", 
                 "valid": [],
                 "invalid": [],
             }
 
             input_list = [input_list]
 
-        self.logger.info(f"\nRunning with check \"%s\" on list of length %d\n" % (check, len(input_list)))
+        if str(value).lower() == "null" or str(value).lower() == "none":
+            value = "none"
+
         found_items = []
         new_list = []
         failed_list = []
@@ -611,10 +791,8 @@ class Tools(AppBase):
                     try:
                         tmp = json.dumps(tmp)
                     except json.decoder.JSONDecodeError as e:
-                        self.logger.info("FAILED DECODING: %s" % e)
                         pass
 
-                #self.logger.info("PRE CHECKS FOR TMP: %")
 
                 # EQUALS JUST FOR STR
                 if check == "equals":
@@ -622,24 +800,15 @@ class Tools(AppBase):
                     # value = tmp.lower()
 
                     if str(tmp).lower() == str(value).lower():
-                        self.logger.info("APPENDED BECAUSE %s %s %s" % (field, check, value))
-                        if not flip:
-                            new_list.append(item)
-                        else:
-                            failed_list.append(item)
+                        new_list.append(item)
                     else:
-                        if flip:
-                            new_list.append(item)
-                        else:
-                            failed_list.append(item)
+                        failed_list.append(item)
 
                 elif check == "equals any of":
-                    self.logger.info("Inside equals any of")
                     checklist = value.split(",")
-                    self.logger.info("Checklist and tmp: %s - %s" % (checklist, tmp))
                     found = False
                     for subcheck in checklist:
-                        subcheck = subcheck.strip()
+                        subcheck = str(subcheck).strip()
 
                         #ext.lower().strip() == value.lower().strip()
                         if type(tmp) == list and subcheck in tmp:
@@ -650,111 +819,66 @@ class Tools(AppBase):
                             new_list.append(item)
                             found = True
                             break
+                        elif type(tmp) == int and str(tmp) == subcheck:
+                            new_list.append(item)
+                            found = True
+                            break
                         else:
-                            print("Nothing matching")
+                            if str(tmp) == str(subcheck):
+                                new_list.append(item)
+                                found = True
+                                break
 
                     if not found:
                         failed_list.append(item)
 
                 # IS EMPTY FOR STR OR LISTS
                 elif check == "is empty":
-                    if tmp == "[]":
+                    if str(tmp) == "[]":
                         tmp = []
 
-                    if type(tmp) == list and len(tmp) == 0 and not flip:
+                    if str(tmp) == "{}":
+                        tmp = []
+
+                    if type(tmp) == list and len(tmp) == 0:
                         new_list.append(item)
-                    elif type(tmp) == list and len(tmp) > 0 and flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and not tmp and not flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and tmp and flip:
+                    elif type(tmp) == str and not tmp:
                         new_list.append(item)
                     else:
                         failed_list.append(item)
 
                 # STARTS WITH = FOR STR OR [0] FOR LIST
                 elif check == "starts with":
-                    if type(tmp) == list and tmp[0] == value and not flip:
+                    if type(tmp) == list and tmp[0] == value:
                         new_list.append(item)
-                    elif type(tmp) == list and tmp[0] != value and flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and tmp.startswith(value) and not flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and not tmp.startswith(value) and flip:
+                    elif type(tmp) == str and tmp.startswith(value):
                         new_list.append(item)
                     else:
                         failed_list.append(item)
 
                 # ENDS WITH = FOR STR OR [-1] FOR LIST
                 elif check == "ends with":
-                    if type(tmp) == list and tmp[-1] == value and not flip:
+                    if type(tmp) == list and tmp[-1] == value:
                         new_list.append(item)
-                    elif type(tmp) == list and tmp[-1] != value and flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and tmp.endswith(value) and not flip:
-                        new_list.append(item)
-                    elif type(tmp) == str and not tmp.endswith(value) and flip:
+                    elif type(tmp) == str and tmp.endswith(value):
                         new_list.append(item)
                     else:
                         failed_list.append(item)
 
                 # CONTAINS FIND FOR LIST AND IN FOR STR
                 elif check == "contains":
-                    if type(tmp) == list and value.lower() in tmp and not flip:
-                        new_list.append(item)
-                    elif type(tmp) == list and value.lower() not in tmp and flip:
-                        new_list.append(item)
-                    elif (
-                        type(tmp) == str
-                        and tmp.lower().find(value.lower()) != -1
-                        and not flip
-                    ):
-                        new_list.append(item)
-                    elif (
-                        type(tmp) == str
-                        and tmp.lower().find(value.lower()) == -1
-                        and flip
-                    ):
+                    #if str(value).lower() in str(tmp).lower():
+                    if str(value).lower() in str(tmp).lower() or self.check_wildcard(value, tmp): 
                         new_list.append(item)
                     else:
                         failed_list.append(item)
+
                 elif check == "contains any of":
-                    self.logger.info("Inside contains any of")
+                    value = self.parse_list_internal(value)
                     checklist = value.split(",")
-                    self.logger.info("Checklist and tmp: %s - %s" % (checklist, tmp))
                     found = False
-                    for subcheck in checklist:
-                        subcheck = subcheck.strip().lower()
-                        #ext.lower().strip() == value.lower().strip()
-                        if type(tmp) == list and subcheck in tmp and not flip:
-                            new_list.append(item)
-                            found = True
-                            break
-                        elif type(tmp) == list and subcheck in tmp and flip:
-                            failed_list.append(item)
-                            found = True
-                            break
-                        elif type(tmp) == list and subcheck not in tmp and not flip:
-                            new_list.append(item)
-                            found = True
-                            break
-                        elif type(tmp) == list and subcheck not in tmp and flip:
-                            failed_list.append(item)
-                            found = True
-                            break
-                        elif (type(tmp) == str and tmp.lower().find(subcheck) != -1 and not flip):
-                            new_list.append(item)
-                            found = True
-                            break
-                        elif (type(tmp) == str and tmp.lower().find(subcheck) != -1 and flip):
-                            failed_list.append(item)
-                            found = True
-                            break
-                        elif (type(tmp) == str and tmp.lower().find(subcheck) == -1 and not flip):
-                            failed_list.append(item)
-                            found = True
-                            break
-                        elif (type(tmp) == str and tmp.lower().find(subcheck) == -1 and flip):
+                    for checker in checklist:
+                        if str(checker).lower() in str(tmp).lower() or self.check_wildcard(checker, tmp): 
                             new_list.append(item)
                             found = True
                             break
@@ -764,69 +888,84 @@ class Tools(AppBase):
 
                 # CONTAINS FIND FOR LIST AND IN FOR STR
                 elif check == "field is unique":
-                    #self.logger.info("FOUND: %s"
-                    if tmp.lower() not in found_items and not flip:
-                        new_list.append(item)
-                        found_items.append(tmp.lower())
-                    elif tmp.lower() in found_items and flip:
+                    if tmp.lower() not in found_items:
                         new_list.append(item)
                         found_items.append(tmp.lower())
                     else:
                         failed_list.append(item)
-
-                    #tmp = json.dumps(tmp)
-
-                    #for item in new_list:
-                    #if type(tmp) == list and value.lower() in tmp and not flip:
-                    #    new_list.append(item)
-                    #    found = True
-                    #    break
-                    #elif type(tmp) == list and value.lower() not in tmp and flip:
-                    #    new_list.append(item)
-                    #    found = True
-                    #    break
 
                 # CONTAINS FIND FOR LIST AND IN FOR STR
-                elif check == "contains any of":
-                    value = self.parse_list_internal(value)
-                    checklist = value.split(",")
-                    tmp = tmp
-                    self.logger.info("CHECKLIST: %s. Value: %s" % (checklist, tmp))
-                    found = False
-                    for value in checklist:
-                        if value in tmp and not flip:
-                            new_list.append(item)
-                            found = True
-                            break
-                        elif value not in tmp and flip:
-                            new_list.append(item)
-                            found = True
-                            break
-
-                    if not found:
-                        failed_list.append(item)
-
                 elif check == "larger than":
-                    if int(tmp) > int(value) and not flip:
-                        new_list.append(item)
-                    elif int(tmp) > int(value) and flip:
-                        new_list.append(item)
-                    else:
+                    list_set = False
+                    try:
+                        if str(tmp).isdigit() and str(value).isdigit():
+                            if int(tmp) > int(value):
+                                new_list.append(item)
+                                list_set = True
+                    except AttributeError as e:
+                        pass
+
+                    try:
+                        value = len(json.loads(value))
+                    except Exception as e:
+                        pass
+
+                    try:
+                        # Check if it's a list in autocast and if so, check the length
+                        if len(json.loads(tmp)) > int(value):
+                            new_list.append(item)
+                            list_set = True
+                    except Exception as e:
+                        pass
+
+                    if not list_set:
                         failed_list.append(item)
                 elif check == "less than":
-                    if int(tmp) < int(value) and not flip:
-                        new_list.append(item)
-                    elif int(tmp) < int(value) and flip:
-                        new_list.append(item)
-                    else:
+                    # Old
+                    #if int(tmp) < int(value):
+                    #    new_list.append(item)
+                    #else:
+                    #    failed_list.append(item)
+
+                    list_set = False
+                    try:
+                        if str(tmp).isdigit() and str(value).isdigit():
+                            if int(tmp) < int(value):
+                                new_list.append(item)
+                                list_set = True
+                    except AttributeError as e:
+                        pass
+
+                    try:
+                        value = len(json.loads(value))
+                    except Exception as e:
+                        pass
+
+                    try:
+                        # Check if it's a list in autocast and if so, check the length
+                        if len(json.loads(tmp)) < int(value):
+                            new_list.append(item)
+                            list_set = True
+                    except Exception as e:
+                        pass
+
+                    if not list_set:
                         failed_list.append(item)
 
                 elif check == "in cache key":
+                    if item == input_list[0]:
+                        self.shared_cache = self.preload_cache(key=value)
+
                     ret = self.check_cache_contains(value, tmp, "true")
+
                     if ret["success"] == True and ret["found"] == True:
                         new_list.append(item)
                     else:
                         failed_list.append(item)
+
+                    if len(self.cache_update_buffer) > 400 or (item == input_list[-1] and len(self.cache_update_buffer) > 0):
+                        self.update_cache(value)
+
 
                     #return {
                     #    "success": True,
@@ -843,12 +982,7 @@ class Tools(AppBase):
                         for file_id in tmp:
                             filedata = self.get_file(file_id)
                             _, ext = os.path.splitext(filedata["filename"])
-                            if (
-                                ext.lower().strip() == value.lower().strip()
-                                and not flip
-                            ):
-                                file_list.append(file_id)
-                            elif ext.lower().strip() != value.lower().strip() and flip:
+                            if (ext.lower().strip() == value.lower().strip()):
                                 file_list.append(file_id)
                             # else:
                             #    failed_list.append(file_id)
@@ -867,32 +1001,28 @@ class Tools(AppBase):
                     elif type(tmp) == str:
                         filedata = self.get_file(tmp)
                         _, ext = os.path.splitext(filedata["filename"])
-                        if ext.lower().strip() == value.lower().strip() and not flip:
+                        if ext.lower().strip() == value.lower().strip():
                             new_list.append(item)
-                        elif ext.lower().strip() != value.lower().strip() and flip:
-                            new_list.append((item, ext))
                         else:
                             failed_list.append(item)
 
             except Exception as e:
-                self.logger.info("[WARNING] FAILED WITH EXCEPTION: %s" % e)
                 failed_list.append(item)
             # return
 
-        if check == "equals any of" and flip:
+        if flip:
             tmplist = new_list
             new_list = failed_list
             failed_list = tmplist
 
-
         try:
-            return json.dumps(
-                {
+            data ={
                     "success": True,
                     "valid": new_list,
                     "invalid": failed_list,
                 }
-            )
+
+            return json.dumps(data)
             # new_list = json.dumps(new_list)
         except json.decoder.JSONDecodeError as e:
             return json.dumps(
@@ -969,8 +1099,8 @@ class Tools(AppBase):
             "%s/api/v1/files/%s?execution_id=%s"
             % (self.url, file_id, self.current_execution_id),
             headers=headers,
+            verify=False,
         )
-        self.logger.info(f"RET: {ret}")
 
         return ret.text
 
@@ -979,18 +1109,16 @@ class Tools(AppBase):
         headers = {
             "Authorization": "Bearer %s" % self.authorization,
         }
-        self.logger.info("HEADERS: %s" % headers)
 
         ret = requests.delete(
             "%s/api/v1/files/%s?execution_id=%s"
             % (self.url, file_id, self.current_execution_id),
             headers=headers,
+            verify=False,
         )
         return ret.text
 
     def create_file(self, filename, data):
-        self.logger.info("Inside function")
-
         try:
             if str(data).startswith("b'") and str(data).endswith("'"):
                 data = data[2:-1]
@@ -1026,19 +1154,34 @@ class Tools(AppBase):
     def get_file_value(self, filedata):
         filedata = self.get_file(filedata)
         if filedata is None:
-            return "File is empty?"
+            return {
+                "success": False,
+                "reason": "File not found",
+            }
 
-        self.logger.info("INSIDE APP DATA: %s" % filedata)
+        if "data" not in filedata:
+            return {
+                "success": False,
+                "reason": "File content not found. File might be empty or not exist",
+            }
+
         try:
             return filedata["data"].decode()
         except:
             try:
                 return filedata["data"].decode("utf-16")
             except:
-                return {
-                    "success": False,
-                    "reason": "Got the file, but the encoding can't be printed",
-                }
+                try:
+                    return filedata["data"].decode("utf-8")
+                except:
+                    try:
+                        return filedata["data"].decode("latin-1")
+                    except:
+                        return {
+                            "success": False,
+                            "reason": "Got the file, but the encoding can't be printed",
+                            "size": len(filedata["data"]),
+                        }
 
     def download_remote_file(self, url, custom_filename=""):
         ret = requests.get(url, verify=False)  # nosec
@@ -1073,7 +1216,6 @@ class Tools(AppBase):
             item = self.get_file(file_id)
             return_ids = None
 
-            self.logger.info("Working with fileformat %s" % fileformat)
             with tempfile.TemporaryDirectory() as tmpdirname:
 
                 # Get archive and save phisically
@@ -1085,13 +1227,10 @@ class Tools(AppBase):
                 # Zipfile for zipped archive
                 if fileformat.strip().lower() == "zip":
                     try:
-                        self.logger.info("Starting zip extraction")
                         with zipfile.ZipFile(os.path.join(tmpdirname, "archive")) as z_file:
                             if password:
-                                self.logger.info("In zip extraction with password")
                                 z_file.setpassword(bytes(password.encode()))
 
-                            self.logger.info("Past zip extraction")
                             for member in z_file.namelist():
                                 filename = os.path.basename(member)
                                 if not filename:
@@ -1099,7 +1238,7 @@ class Tools(AppBase):
 
                                 source = z_file.open(member)
                                 to_be_uploaded.append(
-                                    {"filename": source.name, "data": source.read()}
+                                    {"filename": source.name.split("/")[-1], "data": source.read()}
                                 )
 
                                 return_data["success"] = True
@@ -1124,9 +1263,10 @@ class Tools(AppBase):
                                 filename = os.path.basename(member)
                                 if not filename:
                                     continue
+
                                 source = z_file.open(member)
                                 to_be_uploaded.append(
-                                    {"filename": source.name, "data": source.read()}
+                                    {"filename": source.name.split("/")[-1], "data": source.read()}
                                 )
 
                                 return_data["success"] = True
@@ -1147,9 +1287,13 @@ class Tools(AppBase):
                         ) as z_file:
                             for member in z_file.getnames():
                                 member_files = z_file.extractfile(member)
+
+                                if not member_files:
+                                    continue
+
                                 to_be_uploaded.append(
                                     {
-                                        "filename": member,
+                                        "filename": member.split("/")[-1],
                                         "data": member_files.read(),
                                     }
                                 )
@@ -1165,18 +1309,22 @@ class Tools(AppBase):
                         )
                 elif fileformat.strip().lower() == "tar.gz":
                     try:
-                        with tarfile.open(
-                            os.path.join(tmpdirname, "archive"), mode="r:gz"
-                        ) as z_file:
+                        with tarfile.open(os.path.join(tmpdirname, "archive"), mode="r:gz") as z_file:
                             for member in z_file.getnames():
                                 member_files = z_file.extractfile(member)
+
+                                if not member_files:
+                                    continue
+
                                 to_be_uploaded.append(
                                     {
-                                        "filename": member,
+                                        "filename": member.split("/")[-1],
                                         "data": member_files.read(),
                                     }
                                 )
+
                             return_data["success"] = True
+
                     except Exception as e:
                         return_data["files"].append(
                             {
@@ -1199,7 +1347,7 @@ class Tools(AppBase):
                                 filename = filename.split("/")[-1]
                                 to_be_uploaded.append(
                                     {
-                                        "filename": item["filename"],
+                                        "filename": item["filename"].split("/")[-1],
                                         "data": source.read(),
                                     }
                                 )
@@ -1216,10 +1364,8 @@ class Tools(AppBase):
                 else:
                     return "No such format: %s" % fileformat
 
-            self.logger.info("Breaking as this only handles one archive at a time.")
             if len(to_be_uploaded) > 0:
                 return_ids = self.set_files(to_be_uploaded)
-                self.logger.info(f"Got return ids from files: {return_ids}")
 
                 for i in range(len(return_ids)):
                     return_data["archive_id"] = file_id
@@ -1239,7 +1385,6 @@ class Tools(AppBase):
                             }
                         )
             else:
-                self.logger.info(f"No file ids to upload.")
                 return_data["success"] = False
                 return_data["files"].append(
                     {
@@ -1273,7 +1418,6 @@ class Tools(AppBase):
                     "reason": "Make sure to send valid file ids. Example: file_13eea837-c56a-4d52-a067-e673c7186483,file_13eea837-c56a-4d52-a067-e673c7186484",
                 }
 
-            self.logger.info("picking {}".format(file_ids))
             # GET all items from shuffle
             items = [self.get_file(file_id) for file_id in file_ids]
 
@@ -1283,14 +1427,12 @@ class Tools(AppBase):
             # Dump files on disk, because libs want path :(
             with tempfile.TemporaryDirectory() as tmpdir:
                 paths = []
-                self.logger.info("Number 1")
                 for item in items:
                     with open(os.path.join(tmpdir, item["filename"]), "wb") as f:
                         f.write(item["data"])
                         paths.append(os.path.join(tmpdir, item["filename"]))
 
                 # Create archive temporary
-                self.logger.info("{} items to inflate".format(len(items)))
                 with tempfile.NamedTemporaryFile() as archive:
 
                     if fileformat == "zip":
@@ -1336,7 +1478,6 @@ class Tools(AppBase):
             try:
                 list_one = json.loads(list_one)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list1 as json: %s" % e)
                 if list_one == None:
                     list_one = []
                 else:
@@ -1352,7 +1493,6 @@ class Tools(AppBase):
             try:
                 list_two = json.loads(list_two)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list2 as json: %s" % e)
                 if list_one == None:
                     list_one = []
                 else:
@@ -1376,7 +1516,6 @@ class Tools(AppBase):
             try:
                 list_one = json.loads(list_one)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list1 as json: %s" % e)
                 return {
                     "success": False,
                     "reason": "list_one is not a valid list."
@@ -1386,7 +1525,6 @@ class Tools(AppBase):
             try:
                 list_two = json.loads(list_two)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list2 as json: %s" % e)
                 return {
                     "success": False,
                     "reason": "list_two is not a valid list."
@@ -1427,39 +1565,42 @@ class Tools(AppBase):
             "diff": newdiff,
         }
 
+
     def merge_lists(self, list_one, list_two, set_field="", sort_key_list_one="", sort_key_list_two=""):
         if isinstance(list_one, str):
             try:
                 list_one = json.loads(list_one)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list1 as json: %s" % e)
+                pass
 
         if isinstance(list_two, str):
             try:
                 list_two = json.loads(list_two)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse list2 as json: %s" % e)
+                pass
 
         if not isinstance(list_one, list) or not isinstance(list_two, list):
-            return {"success": False, "message": "Input lists need to be valid JSON lists."}
+            if isinstance(list_one, dict) and isinstance(list_two, dict):
+                for key, value in list_two.items():
+                    list_one[key] = value
+            
+                return list_one
+
+            return {"success": False, "message": "Both input lists need to be valid JSON lists."}
 
         if len(list_one) != len(list_two):
-            return {"success": False, "message": "Lists length must be the same. %d vs %d" % (len(list_one), len(list_two))}
+            return {"success": False, "message": "Lists length must be the same. %d vs %d. Are you trying to add them to a single list? Use add_list_to_list" % (len(list_one), len(list_two))}
 
         if len(sort_key_list_one) > 0:
-            self.logger.info("Sort 1 %s by key: %s" % (list_one, sort_key_list_one))
             try:
                 list_one = sorted(list_one, key=lambda k: k.get(sort_key_list_one), reverse=True)
             except:
-                self.logger.info("Failed to sort list one")
                 pass
 
         if len(sort_key_list_two) > 0:
-            #self.logger.info("Sort 2 %s by key: %s" % (list_two, sort_key_list_two))
             try:
                 list_two = sorted(list_two, key=lambda k: k.get(sort_key_list_two), reverse=True)
             except:
-                self.logger.info("Failed to sort list one")
                 pass
 
         # Loops for each item in sub array and merges items together
@@ -1467,16 +1608,13 @@ class Tools(AppBase):
         base_key = "shuffle_auto_merge"
         try:
             for i in range(len(list_one)):
-                #self.logger.info(list_two[i])
                 if isinstance(list_two[i], dict):
                     for key, value in list_two[i].items():
                         list_one[i][key] = value
                 elif isinstance(list_two[i], str) and list_two[i] == "":
                     continue
                 elif isinstance(list_two[i], str) or isinstance(list_two[i], int) or isinstance(list_two[i], bool):
-                    self.logger.info("IN SETTER FOR %s" % list_two[i])
                     if len(set_field) == 0:
-                        self.logger.info("Define a JSON key to set for List two (Set Field)")
                         list_one[i][base_key] = list_two[i]
                     else:
                         set_field = set_field.replace(" ", "_", -1)
@@ -1489,6 +1627,9 @@ class Tools(AppBase):
             }
 
         return list_one
+
+    def merge_json_objects(self, list_one, list_two, set_field="", sort_key_list_one="", sort_key_list_two=""):
+        return self.merge_lists(list_one, list_two, set_field=set_field, sort_key_list_one=sort_key_list_one, sort_key_list_two=sort_key_list_two)
 
     def fix_json(self, json_data):
         try:
@@ -1521,7 +1662,7 @@ class Tools(AppBase):
                 del json_data[key]
 
         except Exception as e:
-            print("[DEBUG] Problem in JSON (fix_json): %s" % e)
+            pass
 
         return json_data
 
@@ -1551,13 +1692,6 @@ class Tools(AppBase):
             }
 
     def date_to_epoch(self, input_data, date_field, date_format):
-
-        self.logger.info(
-            "Executing with {} on {} with format {}".format(
-                input_data, date_field, date_format
-            )
-        )
-
         if isinstance(input_data, str):
             result = json.loads(input_data)
         else:
@@ -1575,8 +1709,6 @@ class Tools(AppBase):
     ):
         if timestamp== "None":
             return False
-
-        print("Converting input date.")
    
         if date_format == "autodetect":
             input_dt = dateutil_parser(timestamp).replace(tzinfo=None)
@@ -1620,12 +1752,7 @@ class Tools(AppBase):
             comparison_dt = formatted_dt + delta
             #comparison_dt = datetime.datetime.utcnow()
 
-        print("{} {} {} is {}. Delta: {}".format(offset, units, direction, comparison_dt, delta))
-
         diff = int((input_dt - comparison_dt).total_seconds())
-        print(
-            "\nDifference between {} and {} is {} seconds ({} days)\n".format(timestamp, comparison_dt, diff, int(diff/86400))
-        )
 
         if units == "seconds":
             diff = diff
@@ -1663,19 +1790,6 @@ class Tools(AppBase):
             if direction == "ahead" and diff != 0:
                 result = not (result)
 
-        print(
-            "At {}, is {} {} to    {} {} {}? {}. Diff {}".format(
-                formatted_dt,
-                timestamp,
-                equality_test,
-                offset,
-                units,
-                direction,
-                result,
-                diff,
-            )
-        )
-
         parsed_string = "%s %s %s %s" % (equality_test, offset, units, direction)
         newdiff = diff
         if newdiff < 0:
@@ -1693,7 +1807,6 @@ class Tools(AppBase):
 
 
     def run_math_operation(self, operation):
-        self.logger.info("Operation: %s" % operation)
         result = eval(operation)
         return result
 
@@ -1703,8 +1816,6 @@ class Tools(AppBase):
             mapping = json.loads(input_data)
         else:
             mapping = input_data
-
-        self.logger.info(f"Got mapping {json.dumps(mapping, indent=2)}")
 
         result = markupsafe.escape(mapping)
         return mapping
@@ -1720,13 +1831,28 @@ class Tools(AppBase):
             "search": str(value),
             "key": key,
         }
+        directcall = False
+
+        allvalues = {}
+        try:
+            for item in self.local_storage:
+                if item["execution_id"] == self.current_execution_id and item["key"] == key:
+                    # Max keeping the local cache properly for 5 seconds due to workflow continuations
+                    elapsed_time = time.time() - item["time_set"]
+                    if elapsed_time > 5:
+                        break
+
+                    allvalues = item["data"]
+
+        except Exception as e:
+            print("[ERROR] Failed cache contains for current execution id local storage: %s" % e)
 
         if isinstance(value, dict) or isinstance(value, list):
             try:
                 value = json.dumps(value)
             except Exception as e:
-                self.logger.info(f"[WARNING] Error in JSON dumping (cache contains): {e}")
-        
+                pass
+
         if not isinstance(value, str):
             value = str(value)
 
@@ -1737,9 +1863,20 @@ class Tools(AppBase):
         else:
             append = False 
 
-        get_response = requests.post(url, json=data)
+        if "success" not in allvalues:
+            #get_response = requests.post(url, json=data, verify=False)
+            pass
+
         try:
-            allvalues = get_response.json()
+            if "success" not in allvalues:
+                #allvalues = get_response.json()
+                allvalues = self.shared_cache
+
+            if "success" not in allvalues:
+                get_response = requests.post(url, json=data, verify=False)
+                allvalues = get_response.json()
+                directcall = True
+
             try:
                 if allvalues["value"] == None or allvalues["value"] == "null":
                     allvalues["value"] = "[]"
@@ -1752,11 +1889,13 @@ class Tools(AppBase):
                     data["value"] = json.dumps(new_value)
 
                     set_url = "%s/api/v1/orgs/%s/set_cache" % (self.url, org_id)
-                    set_response = requests.post(set_url, json=data)
+                    set_response = requests.post(set_url, json=data, verify=False)
                     try:
                         allvalues = set_response.json()
+                        self.shared_cache = self.preload_cache(key=key)
                         #allvalues["key"] = key
                         #return allvalues
+
 
                         return {
                             "success": True,
@@ -1785,37 +1924,58 @@ class Tools(AppBase):
                 if allvalues["value"] == None or allvalues["value"] == "null":
                     allvalues["value"] = "[]"
 
-                try:
-                    parsedvalue = json.loads(allvalues["value"])
-                except json.decoder.JSONDecodeError as e:
-                    parsedvalue = []
+                if isinstance(allvalues["value"], str):
+                    try:
+                        allvalues["value"] = json.loads(allvalues["value"])
+                    except json.JSONDecodeError:
+                        self.logger.info("[WARNING] Failed inner value cache parsing")
+                        allvalues["value"] = [allvalues["value"]]
 
-                #return parsedvalue
-                    
-                for item in parsedvalue:
-                    #return "%s %s" % (item, value)
-                    if item == value:
-                        if not append:
-                            return {
-                                "success": True,
-                                "found": True,
-                                "reason": "Found and not appending!",
-                                "key": key,
-                                "search": value,
-                                "value": json.loads(allvalues["value"]),
-                            }
-                        else:
-                            return {
-                                "success": True,
-                                "found": True,
-                                "reason": "Found, was appending, but item already exists",
-                                "key": key,
-                                "search": value,
-                                "value": json.loads(allvalues["value"]),
-                            }
-                            
-                        # Lol    
-                        break
+                if not isinstance(allvalues["value"], list):
+                    allvalues["value"] = [allvalues["value"]]
+
+                try:
+                    parsedvalue = json.loads(str(allvalues["value"]))
+                except json.decoder.JSONDecodeError as e:
+                    parsedvalue = allvalues["value"]
+
+                try:
+                    for item in parsedvalue:
+                        #return "%s %s" % (item, value)
+                        #self.logger.info(f"{item} == {value}")
+                        if str(item) == str(value):
+                            if not append:
+                                try:
+                                    newdata = json.loads(json.dumps(data))
+                                    newdata["time_set"] = time.time()
+                                    newdata["data"] = allvalues
+                                    self.local_storage.append(newdata)
+                                except Exception as e:
+                                    print("[ERROR] Failed in local storage append: %s" % e)
+
+                                return {
+                                    "success": True,
+                                    "found": True,
+                                    "reason": "Found and not appending!",
+                                    "key": key,
+                                    "search": value,
+                                    "value": allvalues["value"],
+                                }
+                            else:
+                                return {
+                                    "success": True,
+                                    "found": True,
+                                    "reason": "Found, was appending, but item already exists",
+                                    "key": key,
+                                    "search": value,
+                                    "value": allvalues["value"],
+                                }
+
+                            # Lol
+                            break
+                except Exception as e:
+                    parsedvalue = [str(parsedvalue)]
+                    append = True
 
                 if not append:
                     return {
@@ -1824,39 +1984,39 @@ class Tools(AppBase):
                         "reason": "Not found, not appending (2)!",
                         "key": key,
                         "search": value,
-                        "value": json.loads(allvalues["value"]),
+                        "value": allvalues["value"],
                     }
 
-                #parsedvalue = json.loads(allvalues["value"])
-                #if parsedvalue == None:
-                #    parsedvalue = []
+                #parsedvalue.append(value)
 
-                #return parsedvalue
-                new_value = parsedvalue
-                if new_value == None:
-                    new_value = [value]
+                #data["value"] = json.dumps(parsedvalue)
 
-                new_value.append(value)
-
-                #return new_value 
-
-                data["value"] = json.dumps(new_value)
-                #return allvalues
-
-                set_url = "%s/api/v1/orgs/%s/set_cache" % (self.url, org_id)
-                response = requests.post(set_url, json=data)
+                if value not in allvalues["value"] and isinstance(allvalues["value"], list):
+                    self.cache_update_buffer.append(value)
+                    allvalues["value"].append(value)
                 exception = ""
                 try:
-                    allvalues = response.json()
+                    # FIXME: This is a hack, but it works
+                    if directcall:
+                        new_value = parsedvalue
+                        if new_value == None:
+                            new_value = [value]
+
+                        data["value"] = json.dumps(new_value)
+
+                        set_url = "%s/api/v1/orgs/%s/set_cache" % (self.url, org_id)
+                        response = requests.post(set_url, json=data, verify=False)
+                        allvalues = response.json()
+
                     #return allvalues
 
                     return {
                         "success": True,
                         "found": False,
-                        "reason": "Appended as it didn't exist",
+                        "reason": f"Appended as it didn't exist",
                         "key": key,
                         "search": value,
-                        "value": new_value,
+                        "value": parsedvalue,
                     }
                 except Exception as e:
                     exception = e
@@ -1869,16 +2029,15 @@ class Tools(AppBase):
                     "search": value,
                     "key": key
                 }
-                            
-                self.logger.info("Handle all values!") 
 
             #return allvalues
 
         except Exception as e:
+            print("[ERROR] Failed check cache contains: %s" % e)
             return {
                 "success": False,
                 "key": key,
-                "reason": f"Failed to get cache: {e}",
+                "reason": f"Failed to handle cache contains. Is the original value a list?: {e}",
                 "search": value,
                 "found": False,
             }
@@ -1894,7 +2053,6 @@ class Tools(AppBase):
     ## subkey = "hi", value = "test3", overwrite=False
     ## {"subkey": "hi", "value": ["test2", "test3"]}
 
-    #def set_cache_value(self, key, value):
     def change_cache_subkey(self, key, subkey, value, overwrite):
         org_id = self.full_execution["workflow"]["execution_org"]["id"]
         url = "%s/api/v1/orgs/%s/set_cache" % (self.url, org_id)
@@ -1904,6 +2062,7 @@ class Tools(AppBase):
                 value = json.dumps(value)
             except Exception as e:
                 self.logger.info(f"[WARNING] Error in JSON dumping (set cache): {e}")
+
         elif not isinstance(value, str):
             value = str(value)
 
@@ -1916,7 +2075,7 @@ class Tools(AppBase):
             "value": value,
         }
 
-        response = requests.post(url, json=data)
+        response = requests.post(url, json=data, verify=False)
         try:
             allvalues = response.json()
             allvalues["key"] = key
@@ -1936,6 +2095,9 @@ class Tools(AppBase):
             self.logger.info("Value couldn't be parsed")
             return response.text
 
+    def delete_cache_value(self, key):
+        return self.delete_cache(key)
+
     def get_cache_value(self, key):
         org_id = self.full_execution["workflow"]["execution_org"]["id"]
         url = "%s/api/v1/orgs/%s/get_cache" % (self.url, org_id)
@@ -1947,14 +2109,12 @@ class Tools(AppBase):
             "key": key,
         }
 
-        value = requests.post(url, json=data)
+        value = requests.post(url, json=data, verify=False)
         try:
             allvalues = value.json()
-            self.logger.info("VAL1: ", allvalues)
             allvalues["key"] = key
-            self.logger.info("VAL2: ", allvalues)
 
-            if allvalues["success"] == True:
+            if allvalues["success"] == True and len(allvalues["value"]) > 0:
                 allvalues["found"] = True
             else:
                 allvalues["success"] = True 
@@ -1965,7 +2125,6 @@ class Tools(AppBase):
                 allvalues["value"] = parsedvalue
 
             except:
-                self.logger.info("Parsing of value as JSON failed")
                 pass
 
             return json.dumps(allvalues)
@@ -1973,7 +2132,6 @@ class Tools(AppBase):
             self.logger.info("Value couldn't be parsed, or json dump of value failed")
             return value.text
 
-    # FIXME: Add option for org only & sensitive data (not to be listed)
     def set_cache_value(self, key, value):
         org_id = self.full_execution["workflow"]["execution_org"]["id"]
         url = "%s/api/v1/orgs/%s/set_cache" % (self.url, org_id)
@@ -1996,7 +2154,7 @@ class Tools(AppBase):
             "value": value,
         }
 
-        response = requests.post(url, json=data)
+        response = requests.post(url, json=data, verify=False)
         try:
             allvalues = response.json()
             allvalues["key"] = key
@@ -2036,7 +2194,6 @@ class Tools(AppBase):
         parsedstring = []
         try:
             for key, value in json_object.items():
-                self.logger.info("KV: %s:%s" % (key, value))
                 if isinstance(value, str) or isinstance(value, int) or isinstance(value, bool):
                     if include_key == True:
                         parsedstring.append("%s:%s" % (key, value))
@@ -2056,23 +2213,37 @@ class Tools(AppBase):
 
         return fullstring
 
-    def cidr_ip_match(self, ip, networks):
-        self.logger.info("Executing with\nIP: {},\nNetworks: {}".format(ip, networks))
+    def autofix_network(self, ip_with_cidr):
+        try:
+            # Parse the input as an IPv4 network object
+            network = ipaddress.IPv4Network(ip_with_cidr, strict=False)
+            # Return the corrected network address
+            return str(network)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return None
 
+    def cidr_ip_match(self, ip, networks):
         if isinstance(networks, str):
             try:
                 networks = json.loads(networks)
             except json.decoder.JSONDecodeError as e:
-                self.logger.info("Failed to parse networks list as json: {}. Type: {}".format(
-                    e, type(networks)
-                ))
                 return {
                     "success": False,
                     "reason": "Networks is not a valid list: {}".format(networks),
                 }
 
+        new_networks = []
+        for network in networks:
+            new_network = self.autofix_network(network)
+            if new_network:
+                new_networks.append(new_network)
+
+        networks = new_networks
+
         try:
             ip_networks = list(map(ipaddress.ip_network, networks))
+            #ip_address = ipaddress.ip_address(ip, False)
             ip_address = ipaddress.ip_address(ip)
         except ValueError as e:
             return "IP or some networks are not in valid format.\nError: {}".format(e)
@@ -2089,7 +2260,7 @@ class Tools(AppBase):
     def get_timestamp(self, time_format):
         timestamp = int(time.time())
         if time_format == "unix" or time_format == "epoch":
-            self.logger.info("Running default timestamp %s" % timestamp)
+            pass
 
         return timestamp
 
@@ -2100,12 +2271,12 @@ class Tools(AppBase):
         try:
             md5_value = hashlib.md5(str(value).encode('utf-8')).hexdigest()
         except Exception as e:
-            self.logger.info(f"Error in md5sum: {e}")
+            pass
 
         try:
             sha256_value = hashlib.sha256(str(value).encode('utf-8')).hexdigest()
         except Exception as e:
-            self.logger.info(f"Error in sha256: {e}")
+            pass
 
         parsedvalue = {
             "success": True,
@@ -2123,7 +2294,7 @@ class Tools(AppBase):
 
         data = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=%s" % jwt
 
-        return requests.post(url, data=data, headers=headers).text
+        return requests.post(url, data=data, headers=headers, verify=False).text
 
     # Based on https://google-auth.readthedocs.io/en/master/reference/google.auth.crypt.html
     def get_jwt_from_file(self, file_id, jwt_audience, scopes, complete_request=True):
@@ -2180,7 +2351,6 @@ class Tools(AppBase):
             #signer = crypt.RSASigner.from_service_account_file(sa_keyfile)
             signer = crypt.RSASigner.from_string(sa_keyfile)
             jwt_token = jwt.encode(signer, payload)
-            # print(jwt_token.decode('utf-8'))
             return jwt_token
     
     
@@ -2349,7 +2519,6 @@ class Tools(AppBase):
             json_input = json.loads(json_input, strict=False)
     
         input_synonyms = self.get_synonyms(input_type)
-    
         parsed_data, important_fields = self.run_key_recursion(json_input, input_synonyms)
     
         # Try base64 decoding and such too?
@@ -2371,6 +2540,408 @@ class Tools(AppBase):
             "changed_fields": important_fields,
         }
 
+    def generate_random_string(length=16, special_characters=True):
+        try:
+            length = int(length)
+        except:
+            return {
+                "success": False,
+                "error": "Length needs to be a whole number",
+            }
+
+        # get random password pf length 8 with letters, digits, and symbols
+        characters = string.ascii_letters + string.digits + string.punctuation
+        if str(special_characters).lower() == "false":
+            characters = string.ascii_letters + string.digits + string.punctuation
+
+        password = ''.join(random.choice(characters) for i in range(length))
+
+        return {
+            "success": True,
+            "password": password,
+        }
+    
+    def run_ssh_command(self, host, port, user_name, private_key_file_id, password, command):
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        if port:
+            port = int(port)
+        else:
+            port = 22
+
+        if private_key_file_id:
+            new_file = self.get_file(private_key_file_id)
+
+            try:
+                key_data = new_file["data"].decode()
+            except Exception as e:
+                return {"success":"false","message":str(e)}
+
+            private_key_file = StringIO()
+            private_key_file.write(key_data)
+            private_key_file.seek(0)
+            private_key = paramiko.RSAKey.from_private_key(private_key_file)
+            
+            try:
+                ssh_client.connect(hostname=host,username=user_name,port=port, pkey= private_key)
+            except Exception as e:
+                return {"success":"false","message":str(e)}
+        else:
+            try:
+                ssh_client.connect(hostname=host,username=user_name,port=port, password=str(password))
+            except Exception as e:
+                return {"success":"false","message":str(e)}
+
+        try:
+            stdin, stdout, stderr = ssh_client.exec_command(str(command))
+        except Exception as e:
+            return {"success":"false","message":str(e)}
+
+        return {"success":"true","output": stdout.read().decode(errors='ignore')}
+
+    def parse_ioc(self, input_string, input_type="all"):
+        ioc_types = ["domains", "urls", "email_addresses", "ipv4s", "ipv4_cidrs", "md5s", "sha256s", "sha1s", "cves"]
+
+        # Remember overriding ioc types we care about
+        if input_type == "" or input_type == "all":
+            input_type = "all"
+        else:
+            input_type = input_type.split(",")
+            for i in range(len(input_type)):
+                item = input_type[i]
+
+                item = item.strip()
+                if not item.endswith("s"):
+                    item = "%ss" % item
+
+                input_type[i] = item
+
+            ioc_types = input_type
+
+        iocs = find_iocs(str(input_string), included_ioc_types=ioc_types)
+        newarray = []
+        for key, value in iocs.items():
+            if input_type != "all":
+                if key not in input_type:
+                    continue
+
+            if len(value) > 0:
+                for item in value:
+                    # If in here: attack techniques. Shouldn't be 3 levels so no
+                    # recursion necessary
+                    if isinstance(value, dict):
+                        for subkey, subvalue in value.items():
+                            if len(subvalue) > 0:
+                                for subitem in subvalue:
+                                    data = {
+                                        "data": subitem,
+                                        "data_type": "%s_%s" % (key[:-1], subkey),
+                                    }
+                                    if data not in newarray:
+                                        newarray.append(data)
+                    else:
+                        data = {"data": item, "data_type": key[:-1]}
+                        if data not in newarray:
+                            newarray.append(data)
+
+        # Reformatting IP
+        for item in newarray:
+            if "ip" in item["data_type"]:
+                item["data_type"] = "ip"
+                try:
+                    item["is_private_ip"] = ipaddress.ip_address(item["data"]).is_private
+                except:
+                    pass
+
+        try:
+            newarray = json.dumps(newarray)
+        except json.decoder.JSONDecodeError as e:
+            return "Failed to parse IOC's: %s" % e
+
+        return newarray
+    
+
+    def split_text(self, text):
+        # Split text into chunks of 10kb. Add each 10k to array
+        # In case e.g. 1.2.3.4 lands exactly on 20k boundary, it may be useful to overlap here.
+        # (just shitty code to reduce chance of issues) while still going fast
+        arr_one = []
+        max_len = 5000 
+        current_string = ""
+        overlaps = 100 
+
+        for i in range(0, len(text)):
+            current_string += text[i]
+            if len(current_string) > max_len:
+                # Appending just in case even with overlaps
+                if len(text) > i+overlaps:
+                    current_string += text[i+1:i+overlaps]
+                else:
+                    current_string += text[i+1:]
+
+                arr_one.append(current_string)
+                current_string = ""
+
+        if len(current_string) > 0:
+            arr_one.append(current_string)
+
+        return arr_one 
+
+    def _format_result(self, result):
+        final_result = {}
+        
+        for res in result:
+            for key,val in res.items():
+                if key in final_result:
+                    if isinstance(val, list) and len(val) > 0:
+                        for i in val:
+                            final_result[key].append(i)
+                    elif isinstance(val, dict):
+                        if key in final_result:
+                            if isinstance(val, dict):
+                                for k,v in val.items():
+                                    val[k].append(v)
+                else:
+                    final_result[key] = val
+
+        return final_result
+
+    # See function for how it works~: parse_ioc_new(..)
+    def _with_concurency(self, array_of_strings, ioc_types):
+        results = []
+        #start = time.perf_counter()
+
+        # Workers dont matter..?
+        # What can we use instead? 
+
+        workers = 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit the find_iocs function for each string in the array
+            futures = [executor.submit(
+                find_iocs, 
+                text=string, 
+                included_ioc_types=ioc_types,
+            ) for string in array_of_strings]
+
+            # Wait for all tasks to complete
+            concurrent.futures.wait(futures)
+
+            # Retrieve the results if needed
+            results = [future.result() for future in futures]
+        
+        return self._format_result(results)
+
+    # FIXME: Make this good and actually faster than normal
+    # For now: Concurrency doesn't make it faster due to GIL in python.
+    # May need to offload this to an executable or something 
+    def parse_ioc_new(self, input_string, input_type="all"):
+        if input_type == "":
+            input_type = "all"
+
+        ioc_types = ["domains", "urls", "email_addresses", "ipv4s", "ipv4_cidrs", "md5s", "sha256s", "sha1s", "cves"]
+
+        if input_type == "" or input_type == "all":
+            ioc_types = ioc_types
+        else:
+            input_type = input_type.split(",")
+            for item in input_type:
+                item = item.strip()
+
+            ioc_types = input_type
+
+        input_string = str(input_string)
+
+        if len(input_string) > 10000:
+            iocs = self._with_concurency(self.split_text(input_string), ioc_types=ioc_types)
+        else:
+            iocs = find_iocs(input_string, included_ioc_types=ioc_types)
+
+        newarray = []
+        for key, value in iocs.items():
+            if input_type != "all":
+                if key not in input_type:
+                    continue
+    
+            if len(value) == 0:
+                continue
+
+            for item in value:
+                # If in here: attack techniques. Shouldn't be 3 levels so no
+                # recursion necessary
+                if isinstance(value, dict):
+                    for subkey, subvalue in value.items():
+                        if len(subvalue) == 0:
+                            continue
+
+                        for subitem in subvalue:
+                            data = {
+                                "data": subitem,
+                                "data_type": "%s_%s" % (key[:-1], subkey),
+                            }
+
+                            if data not in newarray:
+                                newarray.append(data)
+                else:
+                    data = {"data": item, "data_type": key[:-1]}
+                    if data not in newarray:
+                        newarray.append(data)
+
+        # Reformatting IP
+        i = -1
+        for item in newarray:
+            i += 1
+            if "ip" not in item["data_type"]:
+                continue
+
+            newarray[i]["data_type"] = "ip"
+            try:
+                newarray[i]["is_private_ip"] = ipaddress.ip_address(item["data"]).is_private
+            except Exception as e:
+                pass
+
+        try:
+            newarray = json.dumps(newarray)
+        except json.decoder.JSONDecodeError as e:
+            return "Failed to parse IOC's: %s" % e
+
+        return newarray
+
+    def merge_incoming_branches(self, input_type="list"):
+        wf = self.full_execution["workflow"]
+        if "branches" not in wf or not wf["branches"]:
+            return {
+                "success": False,
+                "reason": "No branches found"
+            }
+
+        if "results" not in self.full_execution or not self.full_execution["results"]:
+            return {
+                "success": False,
+                "reason": "No results for previous actions not found"
+            }
+
+        if not input_type:
+            input_type = "list"
+
+        branches = wf["branches"]
+        cur_action = self.action
+        #print("Found %d branches" % len(branches))
+
+        results = []
+        for branch in branches:
+            if branch["destination_id"] != cur_action["id"]:
+                continue
+
+            # Find result for the source
+            source_id = branch["source_id"]
+
+            for res in self.full_execution["results"]:
+                if res["action"]["id"] != source_id:
+                    continue
+
+                try:
+                    parsed = json.loads(res["result"])
+                    results.append(parsed)
+                except Exception as e:
+                    results.append(res["result"])
+
+                break
+
+        if input_type == "list":
+            newlist = []
+            for item in results:
+                if not isinstance(item, list):
+                    continue
+
+                for subitem in item:
+                    if subitem in newlist:
+                        continue
+
+                    newlist.append(subitem)
+                #newlist.append(item)
+
+            results = newlist
+        elif input_type == "dict":
+            new_dict = {}
+            for item in results:
+                if not isinstance(item, dict): 
+                    continue
+
+                new_dict = self.merge_lists(new_dict, item)
+
+            results = json.dumps(new_dict)
+        else:
+            return {
+                "success": False,
+                "reason": "No results from source branches with type %s" % input_type
+            }
+
+        return results
+
+    def list_cidr_ips(self, cidr):
+        defaultreturn = {
+            "success": False,
+            "reason": "Invalid CIDR address"
+        }
+
+        if not cidr:
+            return defaultreturn
+
+        if "/" not in cidr:
+            defaultreturn["reason"] = "CIDR address must contain / (e.g. /12)"
+            return defaultreturn
+
+        try:
+            cidrnumber = int(cidr.split("/")[1])
+        except ValueError as e:
+            defaultreturn["exception"] = str(e)
+            return defaultreturn
+
+        if cidrnumber < 12:
+            defaultreturn["reason"] = "CIDR address too large. Please stay above /12"
+            return defaultreturn
+
+        try:
+            net = ipaddress.ip_network(cidr)
+        except ValueError as e:
+            defaultreturn["exception"] = str(e)
+            return defaultreturn
+
+        ips = [str(ip) for ip in net]
+        returnvalue = {
+            "success": True,
+            "amount": len(ips),
+            "ips": ips
+        }
+
+        return returnvalue
+
+    def switch(self, conditions):
+        # Check if conditions is a list or not
+        if not isinstance(conditions, list):
+            conditions = [conditions]
+
+        # True by default
+        to_return = {
+            "success": True,
+            "run_else": True,
+        }
+
+        if len(conditions) == 0:
+            conditions = []
+
+        for condition in conditions:
+            pass
+
+        # Loop conditions
+        # Return them without a loop to make it EASY to understand
+        # Validation should be: 
+        # Continuation based on .id.valid
+        # .valid -> true/false
+        # If no id exists, use name?
+
+        return to_return
 
 if __name__ == "__main__":
     Tools.run()
