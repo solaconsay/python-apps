@@ -2,6 +2,7 @@ import yaml
 import os
 import subprocess
 
+
 basedir = "."
 dirs = os.listdir(basedir)
 #print(dirs)
@@ -33,9 +34,6 @@ for basename in dirs:
 
                 if ret["app_version"] != version:
                     print("Bad version (%s): %s vs %s" % (basename, version, ret["app_version"]))
-
-                if "svg" in ret["large_image"]:
-                    print("Unsupported large_image format: svg")
                 #else:
                 #    print("%s:%s is valid" % (basename, version))
         except (NotADirectoryError, FileNotFoundError) as e:
